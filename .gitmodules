@@ -1,0 +1,6 @@
+[submodule "metrics/ChamferDistancePytorch"]
+	path = metrics/ChamferDistancePytorch
+	url = https://github.com/ThibaultGROUEIX/ChamferDistancePytorch
+[submodule "PointTransformerV3/Pointcept"]
+	path = PointTransformerV3/Pointcept
+	url = https://github.com/Pointcept/Pointcept

@@ -15,6 +15,15 @@ import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
 
 import time
+import wandb
+
+from point_e.evals.feature_extractor import PointNetClassifier, get_torch_devices
+from point_e.evals.fid_is import compute_statistics, compute_inception_score
+from point_e.evals.npz_stream import NpzStreamer
+
+import torch
+import numpy as np
+import os
 
 '''
 some utils
@@ -431,7 +440,8 @@ class Model(nn.Module):
         #self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
                             #dropout=args.dropout, extra_feature_channels=0)
         
-        self.model = PointTransformerV3()
+        self.model = PointTransformerV3(no_conv=args.no_conv, enable_flash=args.enable_flash, enc_patch_size=args.enc_patch_size, dec_patch_size=args.dec_patch_size, qk_norm=args.qk_norm, attn_drop=args.attn_drop, cosine_attention=args.cosine_attention, wandb_run=args.wandb_run)
+        self.grid_size = args.grid_size
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -454,7 +464,7 @@ class Model(nn.Module):
      
         data_reshaped = data.permute(0, 2, 1).reshape(B * N, D).contiguous().to(data.device)
         batch = torch.arange(B).repeat_interleave(N).to(data.device)
-        data_dict = {"feat": data_reshaped, "coord": data_reshaped, "grid_size": 0.01, "batch": batch, "time": t}
+        data_dict = {"feat": data_reshaped, "coord": data_reshaped, "grid_size": self.grid_size, "batch": batch, "time": t}
 
         if self.model.training:
             pointout = self.model(data_dict)
@@ -589,8 +599,15 @@ def train(gpu, opt, output_dir, noises_init):
         should_diag = gpu==0
     else:
         should_diag = True
+
+    outf_syn, tmp, = setup_output_subdirs(output_dir, 'syn', 'tmp')
     if should_diag:
-        outf_syn, = setup_output_subdirs(output_dir, 'syn')
+        run = wandb.init(project='adaLN_ptv3_grid_size_patch_size', id=opt.wandb_id, resume="allow", config=opt)
+        #run = wandb.init(project='adaLN_ptv3_grid_size_patch_size', config=opt)
+        print(f"Wandb logs are being saved to: {wandb.run.dir}")
+        opt.wandb_run = run
+    else:
+        opt.wandb_run = None
 
     if opt.distribution_type == 'multi':
         if opt.dist_url == "env://" and opt.rank == -1:
@@ -620,6 +637,18 @@ def train(gpu, opt, output_dir, noises_init):
 
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
     model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
+
+    # Instantiate a pretrained PointNet++ classifier
+    clf = PointNetClassifier(devices=[torch.device(f"cuda:{gpu}")])
+    # Load the already calculated features on the validation set
+    features_val = np.load('point_e/examples/val_chairs_pointnet_embeddings.npy')
+    # Compute mean and std of the point clouds in the feature space
+    stats_val = compute_statistics(features_val)    
+    
+    # Load the already calculated features on the training set
+    features_train = np.load('point_e/examples/train_chairs_pointnet_embeddings.npy')
+    # Compute mean and std of the point clouds in the feature space
+    stats_train = compute_statistics(features_train)
 
     if opt.distribution_type == 'multi':  # Multiple processes, single GPU per process
         def _transform_(m):
@@ -692,19 +721,20 @@ def train(gpu, opt, output_dir, noises_init):
             elif opt.distribution_type == 'single':
                 x = x.cuda()
                 noises_batch = noises_batch.cuda()
-            
+
             loss = model.get_loss_iter(x, noises_batch).mean()
 
             optimizer.zero_grad()
             loss.backward()
-            netpNorm, netgradNorm = getGradNorm(model)
-            grad_norms = zoomGrad(model)
+
             if opt.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
 
             optimizer.step()
 
             if i % opt.print_freq == 0 and should_diag:
+                netpNorm, netgradNorm = getGradNorm(model)
+                grad_norms = zoomGrad(model)
                 # Convert grad_norms to a string for logging
                 top_grad_info = ', '.join([f'{name}: {norm:.2f}' for name, norm in grad_norms])
 
@@ -715,6 +745,7 @@ def train(gpu, opt, output_dir, noises_init):
                                 epoch, opt.niter, i, len(dataloader), loss.item(),
                                 netpNorm, netgradNorm, top_grad_info
                             ))
+                run.log({"loss": loss.item(), "netpNorm": netpNorm, "netgradNorm":netgradNorm})
                                 
 
         if (epoch + 1) % opt.diagIter == 0 and should_diag:
@@ -741,43 +772,65 @@ def train(gpu, opt, output_dir, noises_init):
 
 
 
-        if (epoch + 1) % opt.vizIter == 0 and should_diag:
-            logger.info(f"GPU {gpu}: Generation: eval")
+        if (epoch + 1) % opt.vizIter == 0:
+            if should_diag:
+                logger.info(f"GPU {gpu}: Generation: eval")
             model.eval()
             with torch.no_grad():
 
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, clip_denoised=True)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=40, clip_denoised=True)
-                x_gen_all = torch.cat(x_gen_list, dim=0)
+                x_gen_eval = model.gen_samples(new_x_chain(x, 128).shape, x.device, clip_denoised=False).permute(0,2,1).detach().cpu().numpy()
+                m, s = train_dataset.all_points_mean, train_dataset.all_points_std
+                x_gen_eval = x_gen_eval * s + m
+
+                np.savez(f'{tmp}/samples_{gpu}.npz', x_gen_eval)
+                features, preds = clf.features_and_preds(NpzStreamer(f'{tmp}/samples_{gpu}.npz'))
+                features, preds = torch.from_numpy(features).to(torch.device(f"cuda:{gpu}")), torch.from_numpy(preds).to(torch.device(f"cuda:{gpu}"))
+
+                # Synchronize all processes before gathering
+                logger.info(f"GPU {gpu}: Reaching gen barrier")
+                start_time = time.time()
+                dist.barrier()
+                end_time = time.time()
+                logger.info(f"GPU {gpu}: Passed gen barrier, time taken: {end_time - start_time:.4f}s")
+
+                # Gather generated samples from all processes
+                gathered_features = [torch.zeros_like(features) for _ in range(dist.get_world_size())]
+                gathered_preds = [torch.zeros_like(preds) for _ in range(dist.get_world_size())]
+
+                # Use `dist.all_gather` to collect tensors from all processes
+                dist.all_gather(gathered_features, features)
+                dist.all_gather(gathered_preds, preds)
+
+                # Concatenate along the first dimension (e.g., batch dimension)
+                all_features = torch.cat(gathered_features, dim=0)
+                all_preds = torch.cat(gathered_preds, dim=0)
+
+                if should_diag:
+                    # Compute mean and std of the point clouds in the feature space
+                    stats = compute_statistics(all_features.detach().cpu().numpy())
+                    # Compute FID between generated samples and validation ones
+                    fid_val = stats.frechet_distance(stats_val)                    
+                    # Compute FID between generated samples and validation ones
+                    fid_train = stats.frechet_distance(stats_train)
+                    # Compute IS of generated samples
+                    inception_score = compute_inception_score(all_preds.detach().cpu().numpy())
+
+                    run.log({"fid_val": fid_val, "fid_train": fid_train, "inception_score": inception_score})
+                    logger.info(f'P-FID_val: {fid_val}, P-FID_train: {fid_train}, P-IS: {inception_score}')
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
                 gen_eval_range = [x_gen_eval.min().item(), x_gen_eval.max().item()]
-
-                logger.info('      [{:>3d}/{:>3d}]  '
+                logger.info(' GPU: {:>3d} [{:>3d}/{:>3d}]  '
                              'eval_gen_range: [{:>10.4f}, {:>10.4f}]     '
                              'eval_gen_stats: [mean={:>10.4f}, std={:>10.4f}]      '
                     .format(
-                    epoch, opt.niter,
+                    gpu, epoch, opt.niter,
                     *gen_eval_range, *gen_stats,
                 ))
 
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval.png' % (outf_syn, epoch),
-                                       x_gen_eval.transpose(1, 2), None, None,
+            visualize_pointcloud_batch(f'{outf_syn}/epoch_{epoch}_samples_eval_GPU_{gpu}.png',
+                                       x_gen_eval, None, None,
                                        None)
-
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all.png' % (outf_syn, epoch),
-                                       x_gen_all.transpose(1, 2), None,
-                                       None,
-                                       None)
-
-            visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
-                                       None,
-                                       None)
-
-
-
-
-
 
 
 
@@ -868,10 +921,19 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
-    parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
+    parser.add_argument('--grad_clip', type=float, default=None, help='help with exploding gradients')
     parser.add_argument('--lr_gamma', type=float, default=0.998, help='lr decay for EBM')
 
     parser.add_argument('--model', default='', help="path to model (to continue training)")
+    parser.add_argument('--wandb_id', default='', help="wandb id to continue training")
+    parser.add_argument('--attn_drop', type=float, default=0.0, help='Regularize attention map')
+    parser.add_argument('--no_conv', action='store_true', default=False, help='If set, sparse convolution will not be applied')
+    parser.add_argument('--enable_flash', action='store_true', default=False, help='If set, flash attention will be applied')
+    parser.add_argument('--qk_norm', action='store_true', default=False, help='If set, QK Normalization will be applied')
+    parser.add_argument('--cosine_attention', action='store_true', default=False, help='If set, cosine attention will be applied')
+    parser.add_argument('--enc_patch_size', type=lambda s: tuple(map(int, s.strip('()').split(','))), default=(1024, 1024, 1024, 1024, 1024))
+    parser.add_argument('--dec_patch_size', type=lambda s: tuple(map(int, s.strip('()').split(','))), default=(1024, 1024, 1024, 1024))
+    parser.add_argument('--grid_size', type=float, default=0.1, help='Adjust voxelization for SparseConv and how points are pooled together')
 
 
     '''distributed'''
@@ -894,7 +956,7 @@ def parse_args():
     '''eval'''
     parser.add_argument('--saveIter', default=100, help='unit: epoch')
     parser.add_argument('--diagIter', default=400, help='unit: epoch')
-    parser.add_argument('--vizIter', default=400, help='unit: epoch')
+    parser.add_argument('--vizIter', default=100, help='unit: epoch')
     parser.add_argument('--print_freq', default=50, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')

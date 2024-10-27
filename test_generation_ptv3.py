@@ -12,11 +12,14 @@ from torch.distributions import Normal
 from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
-from PointTransformerV3.PTV3_incontext import PointTransformerV3
+from PointTransformerV3.PTV3_adaLN import PointTransformerV3
 
 from tqdm import tqdm
 
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+
+import time
+import wandb
 
 '''
 models
@@ -140,7 +143,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
 
-    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_pred_xstart: bool):
+    def p_mean_variance(self, denoise_fn, data, t, clip_denoised: bool, return_eps: bool):
 
         model_output = denoise_fn(data, t)
 
@@ -162,7 +165,7 @@ class GaussianDiffusion:
             x_recon = self._predict_xstart_from_eps(data, t=t, eps=model_output)
 
             if clip_denoised:
-                x_recon = torch.clamp(x_recon, -4.0, 4.0)
+                x_recon = torch.clamp(x_recon, -.5, .5)
 
             model_mean, _, _ = self.q_posterior_mean_variance(x_start=x_recon, x_t=data, t=t)
         else:
@@ -171,8 +174,8 @@ class GaussianDiffusion:
 
         assert model_mean.shape == x_recon.shape == data.shape
         assert model_variance.shape == model_log_variance.shape == data.shape
-        if return_pred_xstart:
-            return model_mean, model_variance, model_log_variance, x_recon
+        if return_eps:
+            return model_mean, model_variance, model_log_variance, model_output
         else:
             return model_mean, model_variance, model_log_variance
 
@@ -183,14 +186,25 @@ class GaussianDiffusion:
                 self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape) * eps
         )
 
+    def _predict_eps_from_xstart(self, x_t, t, x_start):
+        assert x_t.shape == x_start.shape
+        return (
+                x_t / self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_t.device), t, x_t.shape) -
+                x_start / self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape)
+        )
+    
+    def _predict_score_from_eps(self, x_t, t, eps):
+        assert x_t.shape == eps.shape
+        return -eps / self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_t.device), t, x_t.shape)
+
     ''' samples '''
 
-    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_pred_xstart=False, use_var=True):
+    def p_sample(self, denoise_fn, data, t, noise_fn, clip_denoised=False, return_eps=False, use_var=True):
         """
         Sample from the model
         """
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(denoise_fn, data=data, t=t, clip_denoised=clip_denoised,
-                                                                 return_pred_xstart=True)
+                                                                 return_eps=True)
         noise = noise_fn(size=data.shape, dtype=data.dtype, device=data.device)
         assert noise.shape == data.shape
         # no noise when t == 0
@@ -200,10 +214,33 @@ class GaussianDiffusion:
         if use_var:
             sample = sample + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
         assert sample.shape == pred_xstart.shape
-        return (sample, pred_xstart) if return_pred_xstart else sample
+        return (sample, pred_xstart) if return_eps else sample
+
+    def _vb_terms_bpd(self, denoise_fn, data_start, data_t, t, clip_denoised: bool, return_eps: bool):
+        true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(x_start=data_start, x_t=data_t, t=t)
+        model_mean, _, model_log_variance, model_output = self.p_mean_variance(
+            denoise_fn, data=data_t, t=t, clip_denoised=clip_denoised, return_eps=True)
+        kl = normal_kl(true_mean, true_log_variance_clipped, model_mean, model_log_variance)
+        kl = kl.mean(dim=list(range(1, len(data_start.shape)))) / np.log(2.)
+
+        posterior_score = self._predict_score_from_eps(data_t, t=t, eps=self._predict_eps_from_xstart(data_t, t=t, x_start=data_start))
+        score_estimate = self._predict_score_from_eps(data_t, t=t, eps=model_output)
+
+        score_mse_err = torch.mean((posterior_score - score_estimate) ** 2, dim=[1,2])
+        score_rel_err = torch.sum(torch.abs(posterior_score - score_estimate), dim=[1, 2]) / (torch.sum(torch.abs(posterior_score), dim=[1, 2]) + 1e-8)
+
+        score_similarity = torch.nn.functional.cosine_similarity(
+            posterior_score.view(posterior_score.shape[0], -1), 
+            score_estimate.view(score_estimate.shape[0], -1), 
+            dim=1
+        )
+        score_estimate_magnitude = torch.linalg.vector_norm(score_estimate.view(score_estimate.shape[0], -1), dim=1)
+        posterior_score_magnitude = torch.linalg.vector_norm(posterior_score.view(posterior_score.shape[0], -1), dim=1)
+
+        return (kl, score_mse_err, score_rel_err, score_similarity, score_estimate_magnitude, posterior_score_magnitude) if return_eps else kl
 
 
-    def p_sample_loop(self, denoise_fn, shape, device,
+    def p_sample_loop(self, x0, denoise_fn, shape, device,
                       noise_fn=torch.randn, constrain_fn=lambda x, t:x,
                       clip_denoised=True, max_timestep=None, keep_running=False):
         """
@@ -216,17 +253,42 @@ class GaussianDiffusion:
         else:
             final_time = max_timestep
 
+        # Initialize lists for storing metrics
+        kl_ = []
+        score_mse_err_ = []
+        score_rel_err_ = []
+        score_similarity_ = []
+        score_estimate_magnitude_ = []
+        posterior_score_magnitude_ = []
+
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
         for t in reversed(range(0, final_time if not keep_running else len(self.betas))):
             img_t = constrain_fn(img_t, t)
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
-                                  clip_denoised=clip_denoised, return_pred_xstart=False).detach()
+            kl, score_mse_err, score_rel_err, score_similarity, score_estimate_magnitude, posterior_score_magnitude = self._vb_terms_bpd(denoise_fn=denoise_fn, data_start=x0.to(device), data_t=img_t, t=t_, clip_denoised=False, return_eps=True)
+            
+            kl_.append(kl)
+            score_mse_err_.append(score_mse_err)
+            score_rel_err_.append(score_rel_err)
+            score_similarity_.append(score_similarity)
+            score_estimate_magnitude_.append(score_estimate_magnitude)
+            posterior_score_magnitude_.append(posterior_score_magnitude)
 
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn,
+                                  clip_denoised=clip_denoised, return_eps=False).detach()
+
+        # (B, T)
+        # Convert lists to tensors
+        kl_ = torch.stack(kl_).T
+        score_mse_err_ = torch.stack(score_mse_err_).T
+        score_rel_err_ = torch.stack(score_rel_err_).T
+        score_similarity_ = torch.stack(score_similarity_).T
+        score_estimate_magnitude_ = torch.stack(score_estimate_magnitude_).T
+        posterior_score_magnitude_ = torch.stack(posterior_score_magnitude_).T
 
         assert img_t.shape == shape
-        return img_t
+        return img_t, kl_, score_mse_err_, score_rel_err_, score_similarity_, score_estimate_magnitude_, posterior_score_magnitude_
 
     def reconstruct(self, x0, t, denoise_fn, noise_fn=torch.randn, constrain_fn=lambda x, t:x):
 
@@ -241,7 +303,7 @@ class GaussianDiffusion:
             img_t = constrain_fn(img_t, k)
             t_ = torch.empty(x0.shape[0], dtype=torch.int64, device=x0.device).fill_(k)
             img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn,
-                                  clip_denoised=False, return_pred_xstart=False, use_var=True).detach()
+                                  clip_denoised=False, return_eps=False, use_var=True).detach()
 
 
         return img_t
@@ -278,7 +340,9 @@ class Model(nn.Module):
 
         #self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
                             #dropout=args.dropout, extra_feature_channels=0)
-        self.model = PointTransformerV3()
+        
+        self.model = PointTransformerV3(no_conv=args.no_conv, enc_patch_size=args.enc_patch_size, dec_patch_size=args.dec_patch_size, qk_norm=args.qk_norm, attn_drop=args.attn_drop, cosine_attention=args.cosine_attention, wandb_run=args.wandb_run)
+        self.grid_size = args.grid_size
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -292,7 +356,8 @@ class Model(nn.Module):
             'prior_bpd_b': prior_bpd_b,
             'mse_bt':mse_bt
         }
-    
+
+
     def _denoise(self, data, t):
         B, D,N= data.shape
         assert data.dtype == torch.float
@@ -300,9 +365,15 @@ class Model(nn.Module):
      
         data_reshaped = data.permute(0, 2, 1).reshape(B * N, D).contiguous().to(data.device)
         batch = torch.arange(B).repeat_interleave(N).to(data.device)
-        data_dict = {"feat": data_reshaped, "coord": data_reshaped, "grid_size": 0.01, "batch": batch, "time": t}
+        data_dict = {"feat": data_reshaped, "coord": data_reshaped, "grid_size": self.grid_size, "batch": batch, "time": t}
 
-        pointout = self.model(data_dict)
+        if self.model.training:
+            pointout = self.model(data_dict)
+        else:
+            if isinstance(self.model, (nn.parallel.DistributedDataParallel, nn.parallel.DataParallel)):
+                pointout = self.model.module(data_dict)
+            else:
+                pointout = self.model(data_dict)
 
         out = pointout.feat.reshape(B, N, D).permute(0, 2, 1).contiguous().to(data.device)
 
@@ -321,10 +392,10 @@ class Model(nn.Module):
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, shape, device, noise_fn=torch.randn, constrain_fn=lambda x, t:x,
+    def gen_samples(self, x0, shape, device, noise_fn=torch.randn, constrain_fn=lambda x, t:x,
                     clip_denoised=False, max_timestep=None,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
+        return self.diffusion.p_sample_loop(x0, self._denoise, shape=shape, device=device, noise_fn=noise_fn,
                                             constrain_fn=constrain_fn,
                                             clip_denoised=clip_denoised, max_timestep=max_timestep,
                                             keep_running=keep_running)
@@ -458,13 +529,29 @@ def generate(model, opt):
         samples = []
         ref = []
 
+        # Initialize lists for storing metrics
+        kl = []
+        score_mse_err = []
+        score_rel_err = []
+        score_similarity = []
+        score_estimate_magnitude = []
+        posterior_score_magnitude = []
+
         for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
 
             x = data['test_points'].transpose(1,2)
             m, s = data['mean'].float(), data['std'].float()
 
-            gen = model.gen_samples(x.shape,
-                                       'cuda', clip_denoised=True).detach().cpu()
+            gen, kl_, score_mse_err_, score_rel_err_, score_similarity_, score_estimate_magnitude_, posterior_score_magnitude_ = model.gen_samples(x, x.shape,
+                                       'cuda', clip_denoised=False)
+            gen = gen.detach().cpu()
+            
+            kl.append(kl_.detach().cpu())
+            score_mse_err.append(score_mse_err_.detach().cpu())
+            score_rel_err.append(score_rel_err_.detach().cpu())
+            score_similarity.append(score_similarity_.detach().cpu())
+            score_estimate_magnitude.append(score_estimate_magnitude_.detach().cpu())
+            posterior_score_magnitude.append(posterior_score_magnitude_.detach().cpu())
 
             gen = gen.transpose(1,2).contiguous()
             x = x.transpose(1,2).contiguous()
@@ -478,6 +565,20 @@ def generate(model, opt):
 
             visualize_pointcloud_batch(os.path.join(str(Path(opt.eval_path).parent), f'x_{i}.png'), gen[:64], None,
                                        None, None)
+
+        kl = torch.cat(kl, dim=0).mean(dim=0).flip(0)
+        score_mse_err = torch.cat(score_mse_err, dim=0).mean(dim=0).flip(0)
+        score_rel_err = torch.cat(score_rel_err, dim=0).mean(dim=0).flip(0)
+        score_similarity = torch.cat(score_similarity, dim=0).mean(dim=0).flip(0)
+        score_estimate_magnitude = torch.cat(score_estimate_magnitude, dim=0).mean(dim=0).flip(0)
+        posterior_score_magnitude = torch.cat(posterior_score_magnitude, dim=0).mean(dim=0).flip(0)
+
+        torch.save(kl, os.path.join(str(Path(opt.eval_path).parent), 'kl.pt'))
+        torch.save(score_mse_err, os.path.join(str(Path(opt.eval_path).parent), 'score_mse_err.pt')) 
+        torch.save(score_rel_err, os.path.join(str(Path(opt.eval_path).parent), 'score_rel_err.pt'))
+        torch.save(score_similarity, os.path.join(str(Path(opt.eval_path).parent), 'score_similarity.pt'))
+        torch.save(score_estimate_magnitude, os.path.join(str(Path(opt.eval_path).parent), 'score_estimate_magnitude.pt'))
+        torch.save(posterior_score_magnitude, os.path.join(str(Path(opt.eval_path).parent), 'posterior_score_magnitude.pt'))
 
         samples = torch.cat(samples, dim=0)
         ref = torch.cat(ref, dim=0)
@@ -495,6 +596,8 @@ def main(opt):
         opt.beta_start = 1e-5
         opt.beta_end = 0.008
         opt.schedule_type = 'warm0.1'
+    
+    opt.wandb_run = None
 
     exp_id = os.path.splitext(os.path.basename(__file__))[0]
     dir_id = os.path.dirname(__file__)
@@ -567,7 +670,15 @@ def parse_args():
     parser.add_argument('--model_var_type', default='fixedsmall')
 
 
-    parser.add_argument('--model', default='',required=True, help="path to model (to continue training)")
+    parser.add_argument('--model', default='', help="path to model (to continue training)")
+    parser.add_argument('--wandb_id', default='', help="wandb id to continue training")
+    parser.add_argument('--attn_drop', type=float, default=0.0, help='Regularize attention map')
+    parser.add_argument('--no_conv', action='store_true', default=False, help='If set, sparse convolution will not be applied')
+    parser.add_argument('--qk_norm', action='store_true', default=False, help='If set, QK Normalization will be applied')
+    parser.add_argument('--cosine_attention', action='store_true', default=False, help='If set, cosine attention will be applied')
+    parser.add_argument('--enc_patch_size', type=lambda s: tuple(map(int, s.strip('()').split(','))), default=(1024, 1024, 1024, 1024, 1024))
+    parser.add_argument('--dec_patch_size', type=lambda s: tuple(map(int, s.strip('()').split(','))), default=(1024, 1024, 1024, 1024))
+    parser.add_argument('--grid_size', type=float, default=0.1, help='Adjust voxelization for SparseConv and how points are pooled together')
 
     '''eval'''
 

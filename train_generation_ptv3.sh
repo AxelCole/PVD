@@ -16,8 +16,13 @@
 module purge # purge modules inherited by default
 conda deactivate # deactivate environments inherited by default
 
-module load cpuarch/amd # select modules compiled for AMD 
+module load arch/a100 # select modules compiled for AMD
 module load pytorch-gpu/py3/2.1.1 # load modules
+
+export API_KEY='YOUR_WANDB_KEY'
+ 
+wandb login $API_KEY
+wandb offline
 
 set -x # activate echo of launched commands
 python train_generation_ptv3.py --category chair --bs 16 --dataroot /lustre/fswork/projects/rech/mdv/ucq62mm/PVD/data/ShapeNetCore.v2.PC15k/ --model /lustre/fswork/projects/rech/mdv/ucq62mm/PVD/output/train_generation_ptv3/2024-08-17-15-26-33/epoch_1599.pth --distribution_type multi # execute script

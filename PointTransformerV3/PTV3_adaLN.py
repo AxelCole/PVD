@@ -12,6 +12,7 @@ from addict import Dict
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import spconv.pytorch as spconv
 import torch_scatter
 from timm.models.layers import DropPath
@@ -44,7 +45,55 @@ def offset2batch(offset):
 def batch2offset(batch):
     return torch.cumsum(batch.bincount(), dim=0).long()
 
+def statistics(tensor, tensor_name="", wandb_run=None):
+    # Assume tensor shape is (N', H, K, K)
+    
+    # 1. Compute the absolute values of the tensor
+    abs_tensor = tensor.abs()
+    
+    # 2. Compute the row-wise maximum absolute values and their corresponding indices
+    row_max_values, row_max_indices = abs_tensor.max(dim=-1)  # row_max_values: (N', H, K), row_max_indices: (N', H, K)
+    
+    # 3. Flatten the maximum values and indices across all patches (N'), heads (H), and rows (K)
+    flattened_max_values = row_max_values.flatten()  # Shape: (N' * H * K)
+    flattened_max_indices = row_max_indices.flatten()  # Shape: (N' * H * K)
+    
+    # 4. Compute statistics for the maximum absolute row values
+    stats = {
+        f"{tensor_name} max abs mean": flattened_max_values.mean().item(),
+        f"{tensor_name} max abs std": flattened_max_values.std().item(),
+        f"{tensor_name} max abs min": flattened_max_values.min().item(),
+        f"{tensor_name} max abs max": flattened_max_values.max().item(),
+    }
+    
+    # 5. Check if the max indices are close to diagonal (i.e., row index == column index)
+    diagonal_distances = (flattened_max_indices % tensor.shape[-1])  # How far max indices are from diagonal
+    diag_stats = {
+        f"{tensor_name} diagonal index mean": diagonal_distances.float().mean().item(),
+        f"{tensor_name} diagonal index std": diagonal_distances.float().std().item(),
+        f"{tensor_name} diagonal index min": diagonal_distances.float().min().item(),
+        f"{tensor_name} diagonal index max": diagonal_distances.float().max().item(),
+    }
+    
+    # 6. Log the statistics to Wandb (if applicable)
+    if wandb_run is not None:
+        wandb_run.log(stats)
+        wandb_run.log(diag_stats)
+    
+    # Optionally return stats and indices for further analysis if needed
+    return stats, diag_stats, flattened_max_indices
 
+
+
+def check_for_nan_inf(tensor, tensor_name=""):
+    if torch.isnan(tensor).any():
+        print(f"NaN detected in {tensor_name}")
+        raise ValueError(f"NaN values detected in {tensor_name}")
+
+    if torch.isinf(tensor).any():
+        print(f"Inf detected in {tensor_name}")
+        raise ValueError(f"Inf values detected in {tensor_name}")
+    
 class Point(Dict):
     """
     Point Structure of Pointcept
@@ -312,21 +361,26 @@ class SerializedAttention(PointModule):
         patch_size,
         qkv_bias=True,
         qk_scale=None,
+        qk_norm=False,
         attn_drop=0.0,
         proj_drop=0.0,
         order_index=0,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=True,
+        cosine_attention=False,
         upcast_softmax=True,
+        wandb_run=None,
     ):
         super().__init__()
         assert channels % num_heads == 0
         self.channels = channels
         self.num_heads = num_heads
         self.scale = qk_scale or (channels // num_heads) ** -0.5
+        self.qk_norm=qk_norm
         self.order_index = order_index
         self.upcast_attention = upcast_attention
+        self.cosine_attention = cosine_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash
@@ -356,6 +410,15 @@ class SerializedAttention(PointModule):
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
+        self.wandb_run = wandb_run
+
+        if self.qk_norm:
+            self.q_norm = torch.nn.LayerNorm(channels // num_heads)
+            self.k_norm = torch.nn.LayerNorm(channels // num_heads)
+
+        if self.cosine_attention:
+            # cosine attention from Swing Transformer v2
+            self.logit_scale = nn.Parameter(torch.tensor(self.scale), requires_grad=True)
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -443,6 +506,29 @@ class SerializedAttention(PointModule):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
+        # Step 1: Reshape to separate Q, K, and V
+        qkv = qkv.reshape(-1, 3, H, C // H)
+
+        if self.qk_norm or self.cosine_attention:
+            q = qkv[:, 0]
+            k = qkv[:, 1]
+            v = qkv[:, 2]
+            # Step 2: Apply QK Normalization if enabled
+            if self.qk_norm:
+                # Apply normalization to Q and K in place
+                q = self.q_norm(q)  # Normalize Query
+                k = self.k_norm(k)  # Normalize Key
+
+            # Step 3: Apply Cosine Attention if enabled
+            if self.cosine_attention:
+                # Normalize Q and K in place
+                q = F.normalize(q, dim=-1)  # Normalize Query
+                k = F.normalize(k, dim=-1)  # Normalize Key
+
+                # Update scale for cosine attention
+                self.scale = torch.clamp(self.logit_scale, max=torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device))).exp()
+            qkv = torch.stack([q, k, v], dim=1)
+
         if not self.enable_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
             q, k, v = (
@@ -452,17 +538,20 @@ class SerializedAttention(PointModule):
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()
+
             attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
+
             if self.enable_rpe:
                 attn = attn + self.rpe(self.get_rel_pos(point, order))
             if self.upcast_softmax:
                 attn = attn.float()
             attn = self.softmax(attn)
+            statistics(attn, "softmax output", self.wandb_run)
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half().reshape(-1, 3, H, C // H),
+                qkv.half(),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
@@ -513,6 +602,7 @@ class Block(PointModule):
         mlp_ratio=4.0,
         qkv_bias=True,
         qk_scale=None,
+        qk_norm=False,
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.0,
@@ -521,26 +611,35 @@ class Block(PointModule):
         pre_norm=True,
         order_index=0,
         cpe_indice_key=None,
+        no_conv=False,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=True,
+        cosine_attention=False,
         upcast_softmax=True,
+        wandb_run=None,
     ):
         super().__init__()
         self.channels = channels
         self.pre_norm = pre_norm
-
-        self.cpe = PointSequential(
-            spconv.SubMConv3d(
-                channels,
-                channels,
-                kernel_size=3,
-                bias=True,
-                indice_key=cpe_indice_key,
-            ),
-            nn.Linear(channels, channels),
-            norm_layer(channels),
-        )
+        
+        if no_conv:
+            self.cpe = PointSequential(
+                nn.Linear(channels, channels),
+                norm_layer(channels),
+            )
+        else:
+            self.cpe = PointSequential(
+                spconv.SubMConv3d(
+                    channels,
+                    channels,
+                    kernel_size=3,
+                    bias=True,
+                    indice_key=cpe_indice_key,
+                ),
+                nn.Linear(channels, channels),
+                norm_layer(channels),
+            )
 
         self.norm1 = PointSequential(norm_layer(channels))
         self.attn = SerializedAttention(
@@ -549,13 +648,16 @@ class Block(PointModule):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
+            qk_norm=qk_norm,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             order_index=order_index,
             enable_rpe=enable_rpe,
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
+            cosine_attention=cosine_attention,
             upcast_softmax=upcast_softmax,
+            wandb_run=wandb_run,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -591,6 +693,10 @@ class Block(PointModule):
         if not self.pre_norm:
             point = self.norm2(point)
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+        # print('--')
+        # print(self.channels)
+        # print(offset2bincount(point.offset))
+        # print('---------------')
         return point
 
 
@@ -746,22 +852,29 @@ class Embedding(PointModule):
         embed_channels,
         norm_layer=None,
         act_layer=None,
+        no_conv=False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
         # TODO: check remove spconv
-        self.stem = PointSequential(
-            conv=spconv.SubMConv3d(
-                in_channels,
-                embed_channels,
-                kernel_size=5,
-                padding=1,
-                bias=False,
-                indice_key="stem",
-            )
+        if no_conv:
+            self.stem = PointSequential(
+            proj = nn.Linear(in_channels, embed_channels)
         )
+        else:
+            self.stem = PointSequential(
+                conv=spconv.SubMConv3d(
+                    in_channels,
+                    embed_channels,
+                    kernel_size=5,
+                    padding=1,
+                    bias=False,
+                    indice_key="stem",
+                )
+            )
+        
         if norm_layer is not None:
             self.stem.add(norm_layer(embed_channels), name="norm")
         if act_layer is not None:
@@ -816,6 +929,7 @@ class PointTransformerV3(PointModule):
     def __init__(
         self,
         in_channels=3,
+        no_conv=False,
         order=("z", "z-trans", "hilbert", "hilbert-trans"), 
         stride=(2, 2, 2, 2),
         enc_depths=(1, 1, 1, 1, 1),
@@ -829,14 +943,16 @@ class PointTransformerV3(PointModule):
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
+        qk_norm=False,
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.3,
         pre_norm=True,
         shuffle_orders=True,
         enable_rpe=False,
-        enable_flash=True,
+        enable_flash=False,
         upcast_attention=False,
+        cosine_attention=False,
         upcast_softmax=False,
         cls_mode=False,
         pdnorm_bn=False,
@@ -846,6 +962,7 @@ class PointTransformerV3(PointModule):
         pdnorm_adaptive=True,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        wandb_run=None,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -896,6 +1013,7 @@ class PointTransformerV3(PointModule):
             embed_channels=enc_channels[0],
             norm_layer=bn_layer,
             act_layer=act_layer,
+            no_conv=no_conv,
         )
         
         self.final_layer = PointSequential(ln_layer(dec_channels[0]),
@@ -932,6 +1050,7 @@ class PointTransformerV3(PointModule):
                         mlp_ratio=mlp_ratio,
                         qkv_bias=qkv_bias,
                         qk_scale=qk_scale,
+                        qk_norm=qk_norm,
                         attn_drop=attn_drop,
                         proj_drop=proj_drop,
                         drop_path=enc_drop_path_[i],
@@ -940,10 +1059,13 @@ class PointTransformerV3(PointModule):
                         pre_norm=pre_norm,
                         order_index=i % len(self.order),
                         cpe_indice_key=f"stage{s}",
+                        no_conv = no_conv,
                         enable_rpe=enable_rpe,
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
+                        cosine_attention=cosine_attention,
                         upcast_softmax=upcast_softmax,
+                        wandb_run=wandb_run,
                     ),
                     name=f"block{i}",
                 )
@@ -982,6 +1104,7 @@ class PointTransformerV3(PointModule):
                             mlp_ratio=mlp_ratio,
                             qkv_bias=qkv_bias,
                             qk_scale=qk_scale,
+                            qk_norm=qk_norm,
                             attn_drop=attn_drop,
                             proj_drop=proj_drop,
                             drop_path=dec_drop_path_[i],
@@ -990,10 +1113,13 @@ class PointTransformerV3(PointModule):
                             pre_norm=pre_norm,
                             order_index=i % len(self.order),
                             cpe_indice_key=f"stage{s}",
+                            no_conv=no_conv,
                             enable_rpe=enable_rpe,
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
+                            cosine_attention=cosine_attention,
                             upcast_softmax=upcast_softmax,
+                            wandb_run=wandb_run,
                         ),
                         name=f"block{i}",
                     )

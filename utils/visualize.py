@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
+import torch
 import os
 import trimesh
 from pathlib import Path
@@ -194,7 +195,11 @@ def visualize_pointcloud_batch(path, pointclouds, pred_labels, labels, categorie
             colour = 'g'
         else:
             colour = target[idx]
-        pc = pc.cpu().numpy()
+            
+        # Convert PyTorch tensors to NumPy arrays, if necessary
+        if isinstance(pc, torch.Tensor):
+            pc = pc.cpu().numpy()
+
         ax = fig.add_subplot(nrows, ncols, idx + 1, projection='3d')
         ax.scatter(pc[:, 0], pc[:, 2], pc[:, 1], c=colour, s=5)
         ax.view_init(elev=elev, azim=azim)

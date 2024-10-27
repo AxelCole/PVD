@@ -9,3 +9,5 @@ __pycache__
 *.npz
 eval_model
 eval_data
+point_e_model_cache
+point_e/examples/point_e_model_cache
